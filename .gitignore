@@ -1,2 +1,6 @@
 output
+gme_swaps
+processed
+staging
+__pycache__
 .venv

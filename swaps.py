@@ -1,16 +1,31 @@
-import pandas as pd
+import pyarrow as pa
+import pyarrow.csv as csv
+import pyarrow.parquet as pq
+import pyarrow.dataset as ds
+import pyarrow.compute as pc
 import numpy as np
 import glob
 import requests
 import os
+import io
 from zipfile import ZipFile
 import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
+from schemas import PHASE_2, map_columns
+
 # Define some configuration variables
 OUTPUT_PATH = r"./output"  # path to folder where you want filtered reports to save
-MAX_WORKERS = 16  # number of threads to use for downloading and filtering
+STAGING_PATH = (
+    r"./staging"  # path to folder where you want to download and extract reports
+)
+PROCESSED_PATH = (
+    r"./processed"  # path to folder where you want processed reports to save
+)
+MAX_WORKERS = 24  # number of threads to use for downloading and filtering
+
+GME_IDS = ["GME.N", "GME.AX", "US36467W1099", "36467W109"]
 
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
@@ -18,6 +33,14 @@ executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 start = datetime.datetime.today() - datetime.timedelta(days=730)
 end = datetime.datetime.today()
 dates = [start + datetime.timedelta(days=i) for i in range((end - start).days + 1)]
+
+# Generate dates for the first day of the month for the past 24 months
+# months = [(datetime.datetime.today().month - 1 + i) % 12 + 1 for i in range(24)]
+# years = [
+#     datetime.datetime.today().year - ((i + datetime.datetime.today().month - 2) // 12)
+#     for i in range(24, 0, -1)
+# ]
+# dates = [datetime.datetime(year, month, 1) for year, month in zip(years, months)]
 
 # Generate filenames for each date
 filenames = [
@@ -29,46 +52,47 @@ filenames = [
 ]
 
 
+def invalid_row_handler(row):
+    print("Failed to parse the following row:")
+    print(row)
+    return "skip"
+
+
+parse_options = csv.ParseOptions(invalid_row_handler=invalid_row_handler)
+
+
 def download_and_filter(filename):
+    parquet_filename = os.path.join(OUTPUT_PATH, filename.replace(".zip", ".parquet"))
+
+    # Download the zip file if it's not present in the staging directory
+    if os.path.exists(parquet_filename):
+        return
+
     url = f"https://pddata.dtcc.com/ppd/api/report/cumulative/sec/{filename}"
     req = requests.get(url)
 
     if req.status_code != 200:
         print(f"Failed to download {url}")
-        return
+        return False
 
-    with open(filename, "wb") as f:
-        f.write(req.content)
+    contents = io.BytesIO(req.content)
 
-    # Extract csv from zip
-    with ZipFile(filename, "r") as zip_ref:
-        csv_filename = zip_ref.namelist()[0]
-        zip_ref.extractall()
+    table = None
 
     # Load content into dataframe
-    df = pd.read_csv(csv_filename, low_memory=False, on_bad_lines="skip")
+    with ZipFile(contents) as zip_ref:
+        for file in zip_ref.namelist():
+            in_table = csv.read_csv(zip_ref.open(file), parse_options=parse_options)
 
-    # Perform some filtering and restructuring of pre 12/04/22 reports
-    if "Primary Asset Class" in df.columns or "Action Type" in df.columns:
-        df = df[
-            df["Underlying Asset ID"].str.contains(
-                "GME.N|GME.AX|US36467W1099|36467W109", na=False
-            )
-        ]
-    else:
-        df = df[
-            df["Underlier ID-Leg 1"].str.contains(
-                "GME.N|GME.AX|US36467W1099|36467W109", na=False
-            )
-        ]
+            if table is None:
+                table = in_table
+            else:
+                table = pa.concat_tables([table, in_table])
 
-    # Save the dataframe as CSV
-    output_filename = os.path.join(OUTPUT_PATH, f"{csv_filename}")
-    df.to_csv(output_filename, index=False)
+    map_columns(table)
 
-    # Delete original downloaded files
-    os.remove(filename)
-    os.remove(csv_filename)
+    writer = pq.ParquetWriter(parquet_filename, table.schema)
+    writer.write_table(table)
 
 
 tasks = []
@@ -76,120 +100,124 @@ for filename in filenames:
     tasks.append(executor.submit(download_and_filter, filename))
 
 for task in tqdm(as_completed(tasks), total=len(tasks)):
-    pass
+    try:
+        task.result()
+    except Exception as e:
+        # Clean up tasks and exit
+        for task in tasks:
+            task.cancel()
 
-files = glob.glob(OUTPUT_PATH + "/" + "*")
+        raise e
 
-# Ignore "filtered.csv" file
-files = [file for file in files if "filtered" not in file]
-
-
-def filter_merge():
-    master = pd.DataFrame()  # Start with an empty dataframe
-
-    for file in files:
-        df = pd.read_csv(file, low_memory=False)
-
-        # Skip file if the dataframe is empty, meaning it contained only column names
-        if df.empty:
-            continue
-
-        # Check if there is a column named "Dissemination Identifier"
-        if "Dissemination Identifier" not in df.columns:
-            # Rename "Dissemintation ID" to "Dissemination Identifier" and "Original Dissemintation ID" to "Original Dissemination Identifier"
-            df.rename(
-                columns={
-                    "Dissemintation ID": "Dissemination Identifier",
-                    "Original Dissemintation ID": "Original Dissemination Identifier",
-                },
-                inplace=True,
-            )
-
-        master = pd.concat([master, df], ignore_index=True)
-
-    return master
-
-
-master = filter_merge()
-
-# Treat "Original Dissemination Identifier" and "Dissemination Identifier" as long integers
-master["Original Dissemination Identifier"] = master[
-    "Original Dissemination Identifier"
-].astype("Int64")
-
-master["Dissemination Identifier"] = master["Dissemination Identifier"].astype("Int64")
-
-master = master.drop(columns=["Unnamed: 0"], errors="ignore")
-
-master.to_csv(
-    r"output/filtered.csv"
-)  # replace with desired path for successfully filtered and merged report
-
-# Sort by "Event timestamp"
-master = master.sort_values(by="Event timestamp")
-
-"""
-This df represents a log of all the swaps transactions that have occurred in the past two years.
-
-Each row represents a single transaction.  Swaps are correlated by the "Dissemination ID" column.  Any records that
-that have an "Original Dissemination ID" are modifications of the original swap.  The "Action Type" column indicates
-whether the record is an original swap, a modification (or correction), or a termination of the swap.
-
-We want to split up master into a single dataframe for each swap.  Each dataframe will contain the original swap and
-all correlated modifications and terminations.  The dataframes will be saved as CSV files in the 'output_swaps' folder.
-"""
-
-# Create a list of unique Dissemination IDs that have an empty "Original Dissemination ID" column or is NaN
-unique_ids = master[
-    master["Original Dissemination Identifier"].isna()
-    | (master["Original Dissemination Identifier"] == "")
-]["Dissemination Identifier"].unique()
-
-
-# Add unique Dissemination IDs that are in the "Original Dissemination ID" column
-unique_ids = np.append(
-    unique_ids,
-    master["Original Dissemination Identifier"].unique(),
+# # Load all parquet files into a single dataset
+dataset = ds.dataset(
+    OUTPUT_PATH,
+    format="parquet",
+    schema=PHASE_2,
 )
 
+# # Merge / Split into files aligned with the row group size
+ds.write_dataset(
+    dataset,
+    base_dir=PROCESSED_PATH,
+    format="parquet",
+    min_rows_per_group=500000,
+    max_rows_per_file=5 * 10**6,
+)
 
-# filter out NaN from unique_ids
-unique_ids = [int(x) for x in unique_ids if not np.isnan(x)]
+dataset = ds.dataset(
+    PROCESSED_PATH,
+    format="parquet",
+    schema=PHASE_2,
+)
 
-# Remove duplicates
-unique_ids = list(set(unique_ids))
+print("Locating swaps containing GME...")
 
-# For each unique Dissemination ID, filter the master dataframe to include all records with that ID
-# in the "Original Dissemination ID" column
-open_swaps = pd.DataFrame()
-
-for unique_id in tqdm(unique_ids):
-    # Filter master dataframe to include all records with the unique ID in the "Dissemination ID" column
-    swap = master[
-        (master["Dissemination Identifier"] == unique_id)
-        | (master["Original Dissemination Identifier"] == unique_id)
+ids = []
+for batch in tqdm(
+    dataset.to_batches(columns=["Dissemination Identifier", "Underlier ID-Leg 1"])
+):
+    masks = [
+        pc.match_substring(batch.column("Underlier ID-Leg 1"), gme_id)
+        for gme_id in GME_IDS
     ]
 
-    # Determine if the swap was terminated.  Terminated swaps will have a row with a value of "TERM" in the "Event Type" column.
-    was_terminated = (
-        "TERM" in swap["Action type"].values or "ETRM" in swap["Event type"].values
+    m = masks[0]
+    for mask in masks[1:]:
+        m = pc.or_(m, mask)
+
+    matches = batch.filter(m)
+    ids.extend(matches.column("Dissemination Identifier").to_pylist())
+
+gme_swaps = dataset.to_table(filter=ds.field("Dissemination Identifier").isin(ids))
+
+print("Collecting Identifiers...")
+identifier_projection = {
+    "Dissemination Identifier": ds.field("Dissemination Identifier"),
+    "Original Dissemination Identifier": ds.field("Original Dissemination Identifier"),
+}
+
+identifiers = dataset.to_table(columns=identifier_projection)
+
+# Identify "Original Dissemination Identifier" values that are not present in the "Dissemination Identifier" column
+print("Identifying orphaned swaps...")
+
+
+def find_orphans(table):
+    mask = pc.invert(
+        pc.is_in(
+            table.column("Original Dissemination Identifier"),
+            table.column("Dissemination Identifier"),
+            skip_nulls=True,
+        )
     )
 
-    if not was_terminated:
-        open_swaps = pd.concat([open_swaps, swap], ignore_index=True)
-
-    # Save the filtered dataframe as a CSV file
-    output_filename = os.path.join(
-        OUTPUT_PATH,
-        "processed",
-        f"{'CLOSED' if was_terminated else 'OPEN'}_{unique_id}.csv",
+    orphaned_ids = table.filter(mask).filter(
+        ~ds.field("Original Dissemination Identifier").is_nan()
     )
-    swap.to_csv(
-        output_filename,
-        index=False,
-    )  # replace with desired path for successfully filtered and merged report
 
-output_filename = os.path.join(
-    OUTPUT_PATH, "processed", "output/processed/OPEN_SWAPS.csv"
+    return orphaned_ids
+
+
+def find_parents(table, dataset):
+    orphans = find_orphans(table)
+
+    parent_ids = []
+    while orphans.num_rows > 0:
+        orphaned_ids = pc.unique(orphans.column("Original Dissemination Identifier"))
+
+        parents = identifiers.filter(
+            ds.field("Dissemination Identifier").isin(orphaned_ids)
+        )
+
+        if parents.num_rows == 0:
+            print("No parents found")
+            break
+
+        parent_ids.extend(parents.column("Dissemination Identifier").to_pylist())
+
+        print(f"Found {parents.num_rows} parents for {orphans.num_rows} orphans...")
+
+        orphans = find_orphans(parents)
+
+    if len(parent_ids) == 0:
+        return table
+
+    all_parents = dataset.to_table(
+        filter=ds.field("Dissemination Identifier").isin(parent_ids)
+    )
+
+    table = pa.concat_tables([table, all_parents])
+    return table
+
+
+all_gme_swaps = find_parents(gme_swaps, dataset)
+
+# Save all GME swaps to a new dataset
+ds.write_dataset(
+    all_gme_swaps,
+    base_dir="./gme_swaps",
+    format="parquet",
+    min_rows_per_group=500000,
+    max_rows_per_file=5 * 10**6,
 )
-open_swaps.to_csv(output_filename, index=False)

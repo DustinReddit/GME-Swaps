@@ -12,6 +12,7 @@ from zipfile import ZipFile
 import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+import time
 
 from schemas import PHASE_2, map_columns
 
@@ -61,6 +62,17 @@ def invalid_row_handler(row):
 parse_options = csv.ParseOptions(invalid_row_handler=invalid_row_handler)
 
 
+def retry_with_backoff(func, *args, **kwargs):
+    for i in range(5):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            print(f"Failed to execute {func.__name__} on try {i + 1}: {e}")
+            time.sleep(2 ** i)
+
+    print(f"Failed to execute {func.__name__} after 5 tries")
+    return False
+
 def download_and_filter(filename):
     parquet_filename = os.path.join(OUTPUT_PATH, filename.replace(".zip", ".parquet"))
 
@@ -68,11 +80,19 @@ def download_and_filter(filename):
     if os.path.exists(parquet_filename):
         return
 
-    url = f"https://pddata.dtcc.com/ppd/api/report/cumulative/sec/{filename}"
-    req = requests.get(url)
+    def download():
+        url = f"https://pddata.dtcc.com/ppd/api/report/cumulative/sec/{filename}"
+        req = requests.get(url)
 
-    if req.status_code != 200:
-        print(f"Failed to download {url}")
+        if req.status_code != 200:
+            print(f"Failed to download {url}")
+            return False
+
+        return req
+
+    req = retry_with_backoff(download)
+
+    if not req:
         return False
 
     contents = io.BytesIO(req.content)
@@ -117,19 +137,24 @@ dataset = ds.dataset(
 )
 
 # # Merge / Split into files aligned with the row group size
-ds.write_dataset(
-    dataset,
-    base_dir=PROCESSED_PATH,
-    format="parquet",
-    min_rows_per_group=500000,
-    max_rows_per_file=5 * 10**6,
-)
 
-dataset = ds.dataset(
-    PROCESSED_PATH,
-    format="parquet",
-    schema=PHASE_2,
-)
+# Skip if PROCESSED_PATH already exists
+if not os.path.exists(PROCESSED_PATH):
+    os.makedirs(PROCESSED_PATH)
+
+    ds.write_dataset(
+        dataset,
+        base_dir=PROCESSED_PATH,
+        format="parquet",
+        min_rows_per_group=500000,
+        max_rows_per_file=5 * 10**6,
+    )
+
+    dataset = ds.dataset(
+        PROCESSED_PATH,
+        format="parquet",
+        schema=PHASE_2,
+    )
 
 print("Locating swaps containing GME...")
 
@@ -157,7 +182,6 @@ identifier_projection = {
     "Original Dissemination Identifier": ds.field("Original Dissemination Identifier"),
 }
 
-identifiers = dataset.to_table(columns=identifier_projection)
 
 # Identify "Original Dissemination Identifier" values that are not present in the "Dissemination Identifier" column
 print("Identifying orphaned swaps...")
@@ -180,15 +204,31 @@ def find_orphans(table):
 
 
 def find_parents(table, dataset):
+    identifiers = dataset.to_table(columns=identifier_projection)
     orphans = find_orphans(table)
 
     parent_ids = []
+
+    last_orphan_count = orphans.num_rows
+
+    pbar = tqdm(total=last_orphan_count)
+
+    # Use a while loop to find all parents for orphaned swaps
+    # Use tqdm to display a progress bar for the unbounded loop
     while orphans.num_rows > 0:
         orphaned_ids = pc.unique(orphans.column("Original Dissemination Identifier"))
+
+        # Parent IDs will always be smaller than the orphaned IDs, so we can filter out the identifiers
+        # with an ID that is larger than the largest orphaned ID
+        largest_orphaned_id = pc.max(orphaned_ids).as_py()
+        identifiers = identifiers.filter(
+            ds.field("Dissemination Identifier") <= largest_orphaned_id
+        )
 
         parents = identifiers.filter(
             ds.field("Dissemination Identifier").isin(orphaned_ids)
         )
+
 
         if parents.num_rows == 0:
             print("No parents found")
@@ -196,9 +236,11 @@ def find_parents(table, dataset):
 
         parent_ids.extend(parents.column("Dissemination Identifier").to_pylist())
 
-        print(f"Found {parents.num_rows} parents for {orphans.num_rows} orphans...")
+        # print(f"Found {parents.num_rows} parents for {orphans.num_rows} orphans...")
 
         orphans = find_orphans(parents)
+        pbar.update(parents.num_rows)
+        last_orphan_count = orphans.num_rows
 
     if len(parent_ids) == 0:
         return table
@@ -208,6 +250,7 @@ def find_parents(table, dataset):
     )
 
     table = pa.concat_tables([table, all_parents])
+    pbar.close()
     return table
 
 

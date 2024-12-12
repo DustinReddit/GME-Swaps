@@ -18,15 +18,50 @@ from schemas import PHASE_2, map_columns
 
 # Define some configuration variables
 OUTPUT_PATH = r"./output"  # path to folder where you want filtered reports to save
-STAGING_PATH = (
-    r"./staging"  # path to folder where you want to download and extract reports
-)
 PROCESSED_PATH = (
     r"./processed"  # path to folder where you want processed reports to save
 )
+GME_SWAPS_PATH = r"./gme_swaps"  # path to folder where you want GME swaps to save
 MAX_WORKERS = 24  # number of threads to use for downloading and filtering
 
 GME_IDS = ["GME.N", "GME.AX", "US36467W1099", "36467W109"]
+
+# Make paths if they don't exist
+if not os.path.exists(OUTPUT_PATH):
+    os.makedirs(OUTPUT_PATH)
+
+if not os.path.exists(PROCESSED_PATH):
+    os.makedirs(PROCESSED_PATH)
+else:
+    # Ask the user if they want to overwrite the existing processed data
+    response = input(
+        "Processed data already exists. Do you want to overwrite it? (y/n): "
+    )
+
+    if response.lower() != "y":
+        print("Exiting...")
+        exit()
+
+    # Remove existing processed data
+    for file in glob.glob(os.path.join(PROCESSED_PATH, "*")):
+        os.remove(file)
+
+if not os.path.exists(GME_SWAPS_PATH):
+    os.makedirs(GME_SWAPS_PATH)
+
+    # Ask the user if they want to overwrite the existing GME swaps data
+    response = input(
+        "GME swaps data already exists. Do you want to overwrite it? (y/n): "
+    )
+
+    if response.lower() != "y":
+        print("Exiting...")
+        exit()
+
+    # Remove existing GME swaps data
+    for file in glob.glob(os.path.join(GME_SWAPS_PATH, "*")):
+        os.remove(file)
+
 
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
@@ -34,14 +69,6 @@ executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 start = datetime.datetime.today() - datetime.timedelta(days=730)
 end = datetime.datetime.today()
 dates = [start + datetime.timedelta(days=i) for i in range((end - start).days + 1)]
-
-# Generate dates for the first day of the month for the past 24 months
-# months = [(datetime.datetime.today().month - 1 + i) % 12 + 1 for i in range(24)]
-# years = [
-#     datetime.datetime.today().year - ((i + datetime.datetime.today().month - 2) // 12)
-#     for i in range(24, 0, -1)
-# ]
-# dates = [datetime.datetime(year, month, 1) for year, month in zip(years, months)]
 
 # Generate filenames for each date
 filenames = [
@@ -52,7 +79,6 @@ filenames = [
     ]
 ]
 
-
 def invalid_row_handler(row):
     print("Failed to parse the following row:")
     print(row)
@@ -60,7 +86,6 @@ def invalid_row_handler(row):
 
 
 parse_options = csv.ParseOptions(invalid_row_handler=invalid_row_handler)
-
 
 def retry_with_backoff(func, *args, **kwargs):
     for i in range(5):
@@ -137,24 +162,19 @@ dataset = ds.dataset(
 )
 
 # # Merge / Split into files aligned with the row group size
+ds.write_dataset(
+    dataset,
+    base_dir=PROCESSED_PATH,
+    format="parquet",
+    min_rows_per_group=500000,
+    max_rows_per_file=5 * 10**6,
+)
 
-# Skip if PROCESSED_PATH already exists
-if not os.path.exists(PROCESSED_PATH):
-    os.makedirs(PROCESSED_PATH)
-
-    ds.write_dataset(
-        dataset,
-        base_dir=PROCESSED_PATH,
-        format="parquet",
-        min_rows_per_group=500000,
-        max_rows_per_file=5 * 10**6,
-    )
-
-    dataset = ds.dataset(
-        PROCESSED_PATH,
-        format="parquet",
-        schema=PHASE_2,
-    )
+dataset = ds.dataset(
+    PROCESSED_PATH,
+    format="parquet",
+    schema=PHASE_2,
+)
 
 print("Locating swaps containing GME...")
 
@@ -213,8 +233,6 @@ def find_parents(table, dataset):
 
     pbar = tqdm(total=last_orphan_count)
 
-    # Use a while loop to find all parents for orphaned swaps
-    # Use tqdm to display a progress bar for the unbounded loop
     while orphans.num_rows > 0:
         orphaned_ids = pc.unique(orphans.column("Original Dissemination Identifier"))
 

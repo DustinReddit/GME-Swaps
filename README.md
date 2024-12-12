@@ -21,10 +21,11 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-3. Run the script
+3. Run the scripts
 
 ```bash
-python3 main.py
+python3 swaps.py
+python3 correlate_swaps.py
 ```
 
 ## Prerequisites

@@ -150,7 +150,7 @@ correlated_swaps = correlated_swaps[
 ]
 
 # Save a csv file with the correlated swaps
-# correlated_swaps.to_csv("./output/correlated_swaps.csv")
+correlated_swaps.to_csv("./output/correlated_swaps.csv")
 
 # Save the correlated swaps dataset
 ds.write_dataset(

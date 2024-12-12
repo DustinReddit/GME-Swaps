@@ -136,6 +136,7 @@ def download_and_filter(filename):
 
     writer = pq.ParquetWriter(parquet_filename, table.schema)
     writer.write_table(table)
+    writer.close()
 
 
 tasks = []

@@ -13,17 +13,15 @@ import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import time
-
+from config import (
+    OUTPUT_PATH,
+    PROCESSED_PATH,
+    GME_SWAPS_PATH,
+    MAX_WORKERS,
+)
 from schemas import PHASE_2, map_columns
 
 # Define some configuration variables
-OUTPUT_PATH = r"./output"  # path to folder where you want filtered reports to save
-PROCESSED_PATH = (
-    r"./processed"  # path to folder where you want processed reports to save
-)
-GME_SWAPS_PATH = r"./gme_swaps"  # path to folder where you want GME swaps to save
-MAX_WORKERS = 24  # number of threads to use for downloading and filtering
-
 GME_IDS = ["GME.N", "GME.AX", "US36467W1099", "36467W109"]
 
 # Make paths if they don't exist

@@ -21,7 +21,11 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-3. Run the scripts
+3. Config
+
+You can change any of the configuration by modifying the `config.py` file.
+
+4. Run the scripts
 
 ```bash
 python3 swaps.py
@@ -35,11 +39,7 @@ python3 correlate_swaps.py
 ## Output
 
 The script will filter the data and record the transactions related to GME on a daily basis in the specified `output` folder.
-The daily transactions are aggregated into a single file `filtered.csv`.
-
 There will also be a folder named `processed` that traces all transactions swap by swap.
 
-If the swap transactions contain an entry with an `Action type` of `TERM`, then the swap will be marked as CLOSED.
-Otherwise, the swap is considered to still be OPEN.
-
-For convenience, all open swaps are then aggregated into a single file named `OPEN_SWAPS.csv`.
+After running `correlate_swaps.py` there is a file named `correlated_swaps.csv` that is all the swaps data correlated by "Progenitor ID".
+There is also a parquet dataset that is created in the `output` folder that contains all the swaps data for easier querying.

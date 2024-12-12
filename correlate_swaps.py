@@ -6,10 +6,16 @@ import pyarrow.compute as pc
 import pandas as pd
 from tqdm import tqdm
 
+from config import (
+    OUTPUT_PATH,
+    PROCESSED_PATH,
+    GME_SWAPS_PATH,
+    MAX_WORKERS,
+)
 from schemas import CORRELATED_CUSTOM
 
 # Load the swaps dataset
-dataset = ds.dataset("./gme_swaps", format="parquet")
+dataset = ds.dataset(GME_SWAPS_PATH, format="parquet")
 
 # Load the swaps table
 identifiers = dataset.to_table(
@@ -150,12 +156,12 @@ correlated_swaps = correlated_swaps[
 ]
 
 # Save a csv file with the correlated swaps
-correlated_swaps.to_csv("./output/correlated_swaps.csv")
+correlated_swaps.to_csv(OUTPUT_PATH + "/correlated_swaps.csv")
 
 # Save the correlated swaps dataset
 ds.write_dataset(
     correlated_swaps,
-    base_dir="./correlated_swaps",
+    base_dir=OUTPUT_PATH + "/correlated_swaps",
     format="parquet",
     schema=CORRELATED_CUSTOM,
 )

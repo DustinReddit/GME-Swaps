@@ -138,6 +138,19 @@ def download_and_filter(filename):
     writer.write_table(table)
     writer.close()
 
+#Create working folders
+if not os.path.exists(OUTPUT_PATH):
+    os.makedirs(OUTPUT_PATH)
+
+if not os.path.exists(STAGING_PATH):
+    os.makedirs(STAGING_PATH)
+
+if not os.path.exists(PROCESSED_PATH):
+    os.makedirs(PROCESSED_PATH)
+else:
+    files = glob.glob(PROCESSED_PATH + '/*.parquet')
+    for f in files:
+        os.remove(f)
 
 tasks = []
 for filename in filenames:
